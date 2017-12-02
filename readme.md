@@ -21,7 +21,7 @@ firefox 127.0.0.1:1024
 ```
 The latter can be changed by the argument `--public-server`. Root privilege is needed, however.
 ## Installation
-Files `search.html`, `song.html`, `songs.html`, `script.js`, `style.css` has to be placed in the same folder (e.g., `/usr/share/songbook/`). The path of this folder has is set in the function `runServer` of the script `songbook`. By default, `path = "."`.
+Files `search.html`, `song.html`, `songs.html`, `script.js`, `style.css` has to be placed in the same folder (e.g., `/usr/share/songbook/`). The path of this folder can be set in the function `runServer` of the script `songbook`. By default, `path = "."`.
 
 The `songbook` file can be placed wherever you want (e.g., `/usr/bin/`).
 The same is true for the database file (its path is passed as an argument of `songbook` script).
