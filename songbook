@@ -1,0 +1,363 @@
+#!/usr/bin/python3
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from unidecode import unidecode
+import re
+import urllib.parse
+import sqlite3
+import os
+import argparse
+import threading
+
+class SongDatabase( ):
+  def __init__ ( self, filename ):
+    self.database  = sqlite3.connect( filename, check_same_thread=False )
+    self.cursor = self.database.cursor()
+    self.lock = threading.Lock()
+
+  def searchSongs( self, chordsOnly, title, author, lyrics, limit ):
+    with self.lock:
+      if chordsOnly:
+        keys = self.cursor.execute( "SELECT key FROM songs WHERE type = 'chords' AND title_search LIKE ? AND author_search LIKE ? AND lyrics_search LIKE ? ORDER BY author_search, title_search ASC LIMIT ?", ( SongDatabase._convertString( title ), SongDatabase._convertString( author ), SongDatabase._convertString( lyrics ), limit + 1 ) ).fetchall()
+      else:
+        keys = self.cursor.execute( "SELECT key FROM songs WHERE title_search LIKE ? AND author_search LIKE ? AND lyrics_search LIKE ? ORDER BY author_search, title_search ASC LIMIT ?", ( SongDatabase._convertString( title ), SongDatabase._convertString( author ), SongDatabase._convertString( lyrics ), limit + 1 ) ).fetchall()
+    if ( len( keys ) == limit + 1 ):
+      return ( keys[:limit], False )
+    else:
+      return ( keys[:limit] , True )
+
+  def getSongByID( self, id ):
+    with self.lock:
+      return self.cursor.execute( "SELECT id, type, title, author, lyrics FROM songs WHERE id = ?", ( id, ) ).fetchone()
+
+  def getSongByKey( self, key ):
+    with self.lock:
+      return self.cursor.execute( "SELECT id, type, title, author, lyrics FROM songs WHERE key = ?", ( key, ) ).fetchone()
+
+  def createTable( self ):
+    self.cursor.execute( "CREATE TABLE songs ( key integer PRIMARY KEY AUTOINCREMENT, id integer UNIQUE, type text, title text, author text, lyrics text, title_search text, author_search text, lyrics_search text )" )
+
+  def insertSong( self, ida, typea, title, author, lyrics ):
+    self.cursor.execute( "INSERT INTO songs ( id, type, title, author, lyrics, title_search, author_search, lyrics_search ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ? )", ( ida, typea, title, author, lyrics, SongDatabase._getSearchVersion( title ), SongDatabase._getSearchVersion( author ), SongDatabase._getSearchVersion( lyrics ) ) )
+
+  def _commit( self ):
+    self.database.commit()
+
+  @staticmethod
+  def _getSearchVersion( text ):
+    #convert non-asci characters to asci characters
+    text = unidecode( text )
+
+    #convert uppercase to lowercase
+    text = text.lower()
+
+    #convert all whitespace characters to spaces and remove multiple spaces
+    text = re.sub( "\s", " ", text )
+    text = re.sub( " +", " ", text )
+
+    #remove non-alphanumeric or non-space characters
+    text = re.sub( "[^a-zA-Z0-9 ]", "", text)
+
+    return text
+
+  @staticmethod
+  def _convertString( text ):
+    if len( text ) > 0 and text[ 0 ] == "=":
+      verbose = True
+    else:
+      verbose = False
+
+    text = SongDatabase._getSearchVersion( text )
+
+    if verbose:
+      return text
+    else:
+      return "%" + text + "%"
+
+  def __del__( self ):
+    self._commit()
+    self.database.close()
+
+class Cache():
+  def __init__( self, path, cachedFiles ):
+    self.path = path
+    self.cachedFiles = {}
+    for fileName in cachedFiles:
+      self.cacheFile( fileName )
+    
+  #Reloades all files in cache
+  def refresh( self ):
+    for fileName in self.cachedFiles:
+      self.cacheFile( fileName )
+
+  #Loads file into cache
+  def cacheFile( self, fileName ):
+    with open( self.path + "/" + fileName, "r" ) as file:
+      data = file.read()
+    self.cachedFiles[ fileName ] = data
+    return data
+
+  #Returns file from cache or loads file into cache
+  def getFile( self, fileName ):
+    if fileName in self.cachedFiles:
+      return self.cachedFiles[ fileName ]
+    else:
+      cacheFile( self, fileName )
+
+class SongServer( ThreadingMixIn, HTTPServer ):
+  def __init__( self, path, address, handler, databaseFile, localhostOnly ):
+    super().__init__( address, handler )
+    self.cache = Cache( path, [ "script.js", "style.css", "song.html", "songs.html", "search.html" ] )
+    self.localhostOnly = localhostOnly
+    self.currentSong = None
+    self.database = SongDatabase( databaseFile )
+
+  def run( self ):
+    self.serve_forever()
+
+class RequestHandler( BaseHTTPRequestHandler ):
+
+  def substituteWithIndent( self, data, substituentName, substituent ):
+    reReplace = "^(\s*)\#" + substituentName + "\#$"
+    match = re.search( reReplace, data, re.MULTILINE )
+    if match:
+      indentation = match.expand( "\\1" )
+      substituent = indentation + indentation.join( substituent.splitlines( True ) )
+      data = re.sub( reReplace, substituent, data, 0, re.MULTILINE )
+    return data
+          
+  def substitute( self, data, substituentName, substituent ):
+    reReplace = "\#" + substituentName + "\#"
+    data = re.sub( reReplace, substituent, data )
+    return data
+
+  def isLocalhost( self, address ):
+    return ( address == "127.0.0.1" )
+  
+  def isValidNumber( self, string ):
+    reNumber = "^\d{1,7}$"
+    #returns wheter string consists of one to seven digits
+    return ( re.match( reNumber, string ) )
+  
+  def isValidCzechText( self, string ):
+    #returns wheter string consists of sequence of alphanumeric characters with czech diacritics or spaces optionally prefixed by equal sign
+    reText = "^=?[0-9a-zA-ZáéěíýóúůžščřďťňÁÉĚÍÝÓÚŮŽŠČŘĎŤŇ ]{0,50}$"
+    return ( re.match( reText, string ) )
+
+  def sendErrorPage( self ):
+    self.send_response( 200 )
+    self.send_header( 'Content-type','text/html; charset=utf-8' )
+    self.end_headers()
+    self.wfile.write( bytes( "Nothing's here!", "utf8" ) )
+
+  def sendHtmlPage( self, data ):
+    self.send_response( 200 )
+    self.send_header( 'Content-type','text/html; charset=utf-8' )
+    self.end_headers()
+    self.wfile.write( bytes( data, "utf8" ) )
+
+  def sendHtmlPageNoCache( self, data ):
+    self.send_response( 200 )
+    self.send_header( 'Content-type','text/html; charset=utf-8' )
+    self.send_header( 'Cache-Control','no-cache' )
+    self.end_headers()
+    self.wfile.write( bytes( data, "utf8" ) )
+
+  def sendRedirect( self, location ):
+    self.send_response( 301 ) 
+    self.send_header( 'Location', location )
+    self.end_headers()
+
+  def sendData( self, data, mime ):
+    self.send_response( 200 )
+    self.send_header( 'Content-type', mime + "; charset=utf-8" )
+    self.end_headers()
+    self.wfile.write( bytes( data, "utf8" ) )
+
+  def searchPage( self ):
+    return self.server.cache.getFile( "search.html" )
+
+  def noSongPage( self ):
+    return self.substitute( self.server.cache.getFile( "songs.html" ), "body",  "Nothing found." )
+
+  def songPage( self, song ):
+    #substitue end-of-line with <br>
+    lyrics = re.sub( "\n", "<br>\n", song[ 4 ] )
+
+    #if browser doesn't support css, type chords in superscript
+    if not self.useCSS:
+        lyrics = re.sub( "<chord>", "<sup>", lyrics )
+        lyrics = re.sub( "</chord>", "</sup>", lyrics )
+
+    data = self.substituteWithIndent( self.server.cache.getFile( "song.html" ), "body", lyrics )
+    data = self.substitute( data, "title",  song[ 2 ] + " - " + song[ 3 ])
+
+    #if user is master, get current song
+    if self.server.localhostOnly == False and self.isLocalhost( self.client_address[ 0 ] ):
+      self.server.currentSong = data
+    return data
+
+  def songListPage( self, songKeys, allResults ):
+    if len( songKeys ) == 0:
+      return self.noSongPage()
+    elif len( songKeys ) == 1:
+      return self.songPage( self.server.database.getSongByKey( songKeys[ 0 ][ 0 ] ) )
+    else:
+      substituend = self.createSongListTable( songKeys )
+      if not allResults:
+        substituend = substituend + "\nFirst " + str( len( songKeys ) ) + " search results shown."
+      return self.substituteWithIndent( self.server.cache.getFile( "songs.html" ), "body", substituend )
+
+  def createSongListTable( self, songKeys ):
+    output = ""
+    output += "<ul>\n"
+    for songKey in songKeys:
+      output += "  <li>\n"
+      song = self.server.database.getSongByKey( songKey[ 0 ] )
+      output += "    <a href='song?id=" + str( song[ 0 ] ) + "'>" + song[ 2 ] + " - " + song[ 3 ] + " [" + song[ 1 ] + "]" + "</a>\n"
+      output += "  </li>\n"
+    output += "</ul>"
+    return output
+
+  def currentSong():
+    if self.server.currentSong == None:
+      return self.noSongPage()
+    return self.songPage( self.server.currentSong )
+
+  def agentSupportsCSS( self, userAgent ):
+    userAgent = userAgent.lower()
+    return not( "links" in userAgent or "lynx" in userAgent )
+
+  def do_GET(self):
+    if self.server.localhostOnly and not self.isLocalhost( self.client_address[ 0 ] ):
+      return
+    
+    request = urllib.parse.urlparse( self.path )
+    site = request.path
+    parameters = urllib.parse.parse_qs( request.query )
+    self.useCSS = self.agentSupportsCSS( self.headers.get( 'User-agent' ) )
+
+    if site == "/song":
+      #song with key
+      if [ "key" ] == list( parameters.keys() ) and len( parameters[ "key" ] ) == 1:
+        key = parameters[ "key" ][ 0 ]
+        if ( self.isValidNumber( key ) ):
+          key = int( key )
+          data = self.server.database.getSongByKey( key )
+          if data != None:
+            self.sendHtmlPage( self.songPage( data ) )
+            return
+          else:
+            self.sendHtmlPage( self.noSongPage() )
+            return
+
+      #song with id
+      elif [ "id" ] == list( parameters.keys() ) and len( parameters[ "id" ] ) == 1:
+        ID = parameters[ "id" ][ 0 ]
+        if ( self.isValidNumber( ID ) ):
+          ID = int( ID )
+          data = self.server.database.getSongByID( ID )
+          if data != None:
+            self.sendHtmlPage( self.songPage( data ) )
+            return
+          else:
+            self.sendHtmlPage( self.noSongPage() )
+            return
+
+    elif site == "/cache":
+      if list( parameters.keys() ) == []:
+        self.server.cache.refresh();
+        self.sendHtmlPage( "Cache refreshed." )
+        return
+
+    elif site == "/current" and self.server.localhostOnly == False:
+      if list( parameters.keys() ) == []:
+        if self.server.currentSong == None:
+          self.noSongPage()
+          return
+        else:
+          self.sendHtmlPageNoCache( self.server.currentSong )
+          return
+
+    elif site == "/style.css":
+      if list( parameters.keys() ) == []:
+        self.sendData( self.server.cache.getFile( "style.css" ), "text/css" )
+        return
+
+    elif site == "/script.js":
+      if list( parameters.keys() ) == []:
+        self.sendData( self.server.cache.getFile( "script.js" ), "application/javascript" )
+      return
+
+    elif site == "/search":
+      if list( parameters.keys() ) == []:
+        self.sendHtmlPage( self.searchPage() )
+        return
+
+    elif site == "/":
+      if list( parameters.keys() ) == []:
+        self.sendRedirect( "/search" )
+        return
+
+    elif site == "/songs":
+      if set( parameters.keys() ).issubset( { "title", "author", "lyrics", "id", "chordsOnly" } ):
+        if ( "title" not in list( parameters.keys() ) or len( parameters[ "title" ] ) == 1 ) and ( "author" not in list( parameters.keys() ) or len( parameters[ "author" ] ) == 1 ) and ( "lyrics" not in list( parameters.keys() ) or len( parameters[ "lyrics" ] ) == 1 ) and ( "id" not in list( parameters.keys() ) or len( parameters[ "id" ] ) == 1 ) and ( "chordsOnly" not in list( parameters.keys() )  or ( len ( parameters[ "chordsOnly" ] ) == 1  and parameters[ "chordsOnly" ] == [ "true" ] ) ):
+          if "title" in list( parameters.keys() ):
+            title = parameters[ "title" ][ 0 ]
+          else:
+            title = ""
+          if "author" in list( parameters.keys() ):
+            author = parameters[ "author" ][ 0 ]
+          else:
+            author = ""
+          if "lyrics" in list( parameters.keys() ):
+            lyrics = parameters[ "lyrics" ][ 0 ]
+          else:
+            lyrics = ""
+          if "id" in list( parameters.keys() ):
+            ID = parameters[ "id" ][ 0 ]
+          else:
+            ID = ""
+          if "chordsOnly" in list( parameters.keys() ):
+            chordsOnly = True
+          else:
+            chordsOnly = False
+          if self.isValidCzechText( title ) and self.isValidCzechText( author ) and self.isValidCzechText( lyrics ) and ( self.isValidNumber( ID ) or ID == "" ):
+            if ID != "":
+              ID = int( ID )
+              data = self.server.database.getSongByID( ID )
+              if data != None:
+                self.sendRedirect(  "/song?id=" + str( ID ) )
+                return
+            else:
+              ( songKeys, allResults ) = self.server.database.searchSongs( chordsOnly, title, author, lyrics, 1000 )
+              self.sendHtmlPage( self.songListPage( songKeys, allResults ) )
+              return
+
+    self.sendErrorPage()
+
+def runServer( databaseFile, localhostOnly ):
+  if localhostOnly:
+    serverAddress = ('127.0.0.1', 1024 )
+  else:
+    serverAddress = ('0.0.0.0', 80 )
+
+  path = "."
+  songServer = SongServer( path, serverAddress, RequestHandler, databaseFile, localhostOnly )
+  songServer.run()
+
+def createExampleDatabase():
+  database = SongDatabase( "example.db" )
+  database.createTable()
+  database.insertSong( "1", "chords", "Title", "Author", "Lyrics with <chord>C</chord>chords." )
+  database.insertSong( "2", "chords", "Song", "Interpret", "La,<chord>C</chord> la, la<chord>Am</chord>..." )
+  database.insertSong( "3", "lyrics", "Song", "Interpret", "La, la, la..." )
+
+parser = argparse.ArgumentParser()
+parser.add_argument( '--public-server', dest='localhostOnly', action='store_false' )
+parser.add_argument( '--private-server', dest='localhostOnly', action='store_true' )
+parser.add_argument( 'databaseFilename', metavar="DATABASE_FILENAME" )
+parser.set_defaults( localhostOnly = True )
+args = parser.parse_args()
+
+runServer( args.databaseFilename, args.localhostOnly )
